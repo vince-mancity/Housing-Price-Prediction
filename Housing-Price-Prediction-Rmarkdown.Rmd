@@ -1,0 +1,907 @@
+---
+title: "STT 481 Final Project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2) 
+library(leaps) 
+library(glmnet) 
+library(pls) 
+library(class)
+```
+
+
+#### Import Data
+First we import data and see different parameters of this dataset. Therefore we have something in mind about which parameters are quantiliative and which parameters are qualitative.
+
+```{r}
+#Import data
+train <- read.csv('train.csv', header = TRUE) 
+test <- read.csv('test.csv', header = TRUE) 
+summary(train)
+```
+
+```{r}
+str(train)
+```
+
+
+```{r}
+library(ggplot2)
+par(mfrow=c(1,2))
+ggplot(data = train, aes(x = SalePrice)) + geom_histogram(bins = 50)
+ggplot(data = train, aes(x = log(SalePrice+1))) + geom_histogram(bins = 50)
+```
+
+
+In the next couple steps, we discuss each parameters in the dataset and preprossing the whole dataset. Therefore we can have a nice dataset to drive into our modeling in the next couple steps. Also, It's very important to be noticed that we use log transformation in Saleprice or y in this problem since we discover some right-skew distribution in the original dataset.
+
+
+```{r}
+train$SalePrice <- log(train$SalePrice+1)
+
+# save the id columns that are needed to compose the submission file 
+train.id <- train$Id 
+test.id <- test$Id
+
+# add SalePrice column to test set 
+test$SalePrice <- NA
+
+# combine the training and test sets 
+combined <- rbind(train, test)
+
+# drop id column which is unnecessary for the prediction 
+combined <- combined[, -1]
+combined$GarageYrBlt[which(combined$GarageYrBlt == 2207)] <- 2007
+
+library(e1071)
+# convert MSSubclass that represents categorical variable to factor 
+combined$MSSubClass <- as.factor(combined$MSSubClass)
+
+# convert MoSold and YrSold to factors 
+combined$MoSold <- as.factor(combined$MoSold) 
+combined$YrSold <- as.factor(combined$YrSold)
+
+# impute LotFrontage with mean 
+combined$LotFrontage[is.na(combined$LotFrontage)] <- mean(combined$LotFrontage[!is.na(combined$LotFrontage)])
+
+# MasVnrArea 
+combined$MasVnrArea[is.na(combined$MasVnrType)] <- 0
+  
+# Basement
+combined$BsmtFinSF1[is.na(combined$BsmtFinSF1) & is.na(combined$BsmtQual)] <- 0 
+combined$BsmtFinSF2[is.na(combined$BsmtFinSF2) & is.na(combined$BsmtQual)] <- 0 
+combined$BsmtUnfSF[is.na(combined$BsmtUnfSF) & is.na(combined$BsmtQual)] <- 0 
+combined$TotalBsmtSF[is.na(combined$TotalBsmtSF) & is.na(combined$BsmtQual)] <- 0
+
+# Bath
+combined$BsmtFullBath[is.na(combined$BsmtFullBath)] <- 0 
+combined$BsmtHalfBath[is.na(combined$BsmtHalfBath)] <- 0
+
+# Garage
+combined$GarageCars[is.na(combined$GarageCars)] <- 0
+combined$GarageYrBlt[is.na(combined$GarageYrBlt)] <- combined$YearBuilt[is.na(combined$GarageYrBlt)]
+combined$GarageArea[is.na(combined$GarageArea)] <- 0
+
+# fix skewness for numeric variables
+var.classes <- sapply(names(combined), function(x){class(combined[[x]])}) 
+numeric.col <- names(var.classes[var.classes != "factor"])
+numeric.col <- numeric.col[-length(numeric.col)]
+skew <- sapply(numeric.col, function(x){skewness(combined[[x]], na.rm = TRUE)}) 
+skew <- skew[skew > 0.75]
+for(x in names(skew)) {
+combined[[x]] <- log(combined[[x]] + 1)
+}
+
+# Alley
+combined$Alley <- as.character(combined$Alley) 
+combined$Alley[is.na(combined$Alley)] <- "None" 
+combined$Alley <- as.factor(combined$Alley)
+
+# drop Utilities that is not significant for prediction
+combined$Utilities <- NULL
+
+# Basement
+combined$BsmtQual <- as.character(combined$BsmtQual) 
+combined$BsmtCond <- as.character(combined$BsmtCond) 
+combined$BsmtExposure <- as.character(combined$BsmtExposure) 
+combined$BsmtFinType1 <- as.character(combined$BsmtFinType1) 
+combined$BsmtFinType2 <- as.character(combined$BsmtFinType2) 
+combined$BsmtQual[is.na(combined$BsmtQual)] <- "None" 
+combined$BsmtCond[is.na(combined$BsmtCond)] <- "None" 
+combined$BsmtExposure[is.na(combined$BsmtExposure)] <- "None" 
+combined$BsmtFinType1[is.na(combined$BsmtFinType1)] <- "None" 
+combined$BsmtFinType2[is.na(combined$BsmtFinType2)] <- "None" 
+combined$BsmtQual <- as.factor(combined$BsmtQual) 
+combined$BsmtCond <- as.factor(combined$BsmtCond) 
+combined$BsmtExposure <- as.factor(combined$BsmtExposure) 
+combined$BsmtFinType1 <- as.factor(combined$BsmtFinType1) 
+combined$BsmtFinType2 <- as.factor(combined$BsmtFinType2)
+
+# impute Electrical with mode
+combined$Electrical <- as.character(combined$Electrical) 
+combined$Electrical[is.na(combined$Electrical)] <- "SBrkr" 
+combined$Electrical <- as.factor(combined$Electrical)
+
+```
+
+
+
+```{r}
+# impute KitchenQual with average (TA) based on the OverallQual
+combined$KitchenQual <- as.character(combined$KitchenQual) 
+combined$KitchenQual[is.na(combined$KitchenQual)] <- "TA" 
+combined$KitchenQual <- as.factor(combined$KitchenQual)
+
+# impute Functional with mode
+combined$Functional <- as.character(combined$Functional) 
+combined$Functional[is.na(combined$Functional)] <- "Typ" 
+combined$Functional <- as.factor(combined$Functional)
+
+# FireplaceQu
+combined$FireplaceQu <- as.character(combined$FireplaceQu) 
+combined$FireplaceQu[is.na(combined$FireplaceQu)] <- "None" 
+combined$FireplaceQu <- as.factor(combined$FireplaceQu)
+
+# Garage
+combined$GarageFinish <- as.character(combined$GarageFinish) 
+combined$GarageQual <- as.character(combined$GarageQual) 
+combined$GarageCond <- as.character(combined$GarageCond) 
+combined$GarageFinish[is.na(combined$GarageFinish)] <- "None" 
+combined$GarageQual[is.na(combined$GarageQual)] <- "None" 
+combined$GarageCond[is.na(combined$GarageCond)] <- "None" 
+combined$GarageFinish <- as.factor(combined$GarageFinish) 
+combined$GarageQual <- as.factor(combined$GarageQual) 
+combined$GarageCond <- as.factor(combined$GarageCond)
+
+# PoolQC
+combined$PoolQC <- as.character(combined$PoolQC) 
+combined$PoolQC[is.na(combined$PoolQC)] <- "None" 
+combined$PoolQC <- as.factor(combined$PoolQC)
+
+# Fence
+combined$Fence <- as.character(combined$Fence) 
+combined$Fence[is.na(combined$Fence)] <- "None" 
+combined$Fence <- as.factor(combined$Fence)
+
+# impute MSZoning with mode
+combined$MSZoning <- as.character(combined$MSZoning) 
+combined$MSZoning[is.na(combined$MSZoning)] <- "RL" 
+combined$MSZoning <- as.factor(combined$MSZoning)
+
+# impute Exterior1st and Exterior2nd with mode 
+combined$Exterior1st <- as.character(combined$Exterior1st) 
+combined$Exterior2nd <- as.character(combined$Exterior2nd) 
+combined$Exterior1st[is.na(combined$Exterior1st)] <- "VinylSd" 
+combined$Exterior2nd[is.na(combined$Exterior2nd)] <- "HdBoard" 
+combined$Exterior1st <- as.factor(combined$Exterior1st) 
+combined$Exterior2nd <- as.factor(combined$Exterior2nd)
+
+# MasVnrType
+combined$MasVnrType <- as.character(combined$MasVnrType) 
+combined$MasVnrType[is.na(combined$MasVnrType)] <- "None" 
+combined$MasVnrType <- as.factor(combined$MasVnrType)
+
+# GarageType
+combined$GarageType <- as.character(combined$GarageType) 
+combined$GarageType[is.na(combined$GarageType)] <- "None" 
+combined$GarageType <- as.factor(combined$GarageType)
+
+# MiscFeature
+combined$MiscFeature <- as.character(combined$MiscFeature) 
+combined$MiscFeature[is.na(combined$MiscFeature)] <- "None" 
+combined$MiscFeature <- as.factor(combined$MiscFeature)
+
+# SaleType
+combined$SaleType <- as.character(combined$SaleType) 
+combined$SaleType[is.na(combined$SaleType)] <- "Oth" 
+combined$SaleType <- as.factor(combined$SaleType)
+
+
+train <- combined[!is.na(combined$SalePrice),] 
+test <- combined[is.na(combined$SalePrice),]
+
+```
+From above analysis, we found our best parameter for modeling this dataset and use them in below each model.
+
+#### Different Model for the dataset
+
+##### Linear Regression
+```{r}
+
+set.seed(421)
+
+fold.index <- cut(sample(1:nrow(train)), breaks=10, labels=FALSE) 
+pred.error <- rep(0, 10)
+for (i in 1:10) {
+test.index <- which(fold.index==i)
+sp.lm.mod <- lm(SalePrice~MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+
+               YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+BsmtFullBath
+             +BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+
+               GarageCars+GarageArea+WoodDeckSF+ScreenPorch,train[-test.index,])
+pred.lm <- predict(sp.lm.mod, train[test.index, ]) 
+true.lm <- train[test.index, ]$SalePrice 
+pred.error[i] <- mean((pred.lm-true.lm)^2)
+}
+# cv estimate
+mse.lm <- mean(pred.error) 
+mse.lm
+```
+
+```{r}
+sp.lm.mod <- lm(SalePrice~MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+
+               YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+BsmtFullBath
+             +BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+
+               GarageCars+GarageArea+WoodDeckSF+ScreenPorch,train)
+pred.lm <- predict(sp.lm.mod, test)
+pred.lm[which(is.na(pred.lm))] <- mean(pred.lm, na.rm = TRUE) 
+test.lm <- data.frame(Id = test.id, SalePrice = exp(pred.lm)-1) 
+head(test.lm,5)
+```
+
+
+```{r}
+write.csv(test.lm,file='Linear Regression Model Housing Price.csv',row.names = FALSE)
+```
+
+
+##### Subset Selection Methods
+```{r}
+predict.regsubsets = function(object, newdata, id){ 
+  form = as.formula(object$call[[2]])
+  mat = model.matrix(form, newdata)
+  coefi = coef(object, id=id)
+  xvars = names(coefi)
+  mat[,xvars]%*%coefi
+}
+```
+
+```{r}
+library(glmnet)
+
+fit.best <- regsubsets(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+
+               YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+BsmtFullBath
+             +BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+
+               GarageCars+GarageArea+WoodDeckSF+ScreenPorch,
+                       data = train, nvmax = 27)
+best.summary <- summary(fit.best) 
+which.min(best.summary$cp)
+```
+
+```{r}
+which.min(best.summary$bic)
+```
+
+```{r}
+which.max(best.summary$adjr2)
+```
+
+```{r}
+par(mfrow = c(2, 2))
+plot(best.summary$cp, xlab = "Subset Size", ylab = "Cp", pch = 20, type = "l") 
+points(24, best.summary$cp[24], pch = 4, col = "red", lwd = 7)
+plot(best.summary$bic, xlab = "Subset Size", ylab = "BIC", pch = 20, type = "l") 
+points(21, best.summary$bic[21], pch = 4, col = "red", lwd = 7)
+plot(best.summary$adjr2, xlab = "Subset Size", ylab = "Adjusted R2", pch = 20, type = "l") 
+points(25, best.summary$adjr2[25], pch = 4, col = "red", lwd = 7)
+coef(fit.best, which.max(best.summary$adjr2))
+```
+
+According to the above summary, the best subset selection with cp choosing 24 variables, BIC choosing 21 variables and adjusted R^2 choosing 25 variables
+
+```{r}
+k = 10
+set.seed(123)
+folds = sample(1:k, nrow(train), replace = TRUE) 
+cv.errors = matrix(NA, k, 27, dimnames = list(NULL, paste(1:27))) 
+for(j in 1:k){
+  fit.best = regsubsets(SalePrice ~
+                          MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+GarageCars+GarageArea+WoodDeckSF+ScreenPorch, data = train[folds != j,],
+                        nvmax=27)
+  for (i in 1:27){
+    pred = predict.regsubsets(fit.best, train[folds == j, ], id = i) 
+    cv.errors[j, i] = mean((train$SalePrice[folds == j] - pred)^2)
+    }
+}
+mean.cv.errors = apply(cv.errors, 2, mean) 
+mean.cv.errors
+
+mse.best <- min(mean.cv.errors) 
+names(which.min(mean.cv.errors))                   
+```
+
+```{r}
+fit.best = regsubsets(SalePrice ~
+                        MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+ GarageCars+GarageArea+WoodDeckSF+ScreenPorch,
+                      train, nvmax = 26)
+test.mat = model.matrix( ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+
+                           BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+
+                           BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+ 
+                           GarageCars+GarageArea+WoodDeckSF+ScreenPorch, test)
+coefi = coef(fit.best, id = 26)
+pred.best = test.mat[,names(coefi)]%*%coefi
+pred.best = data.frame(exp(pred.best)-1)
+test.best <- data.frame(Id = test.id, SalePrice = pred.best[, 1]) 
+head(test.best, 5)
+```
+
+```{r}
+write.csv(test.best,file='Best Subset selection Housing Price.csv',row.names = FALSE)
+```
+
+##### Forward Selection Method
+```{r}
+fit.fwd <- regsubsets(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                        X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+
+                        GarageCars+GarageArea+WoodDeckSF+ScreenPorch,
+                      data = train, nvmax = 27, method='forward')
+fwd.summary <- summary(fit.fwd) 
+which.min(fwd.summary$cp)
+
+```
+
+
+```{r}
+which.min(fwd.summary$bic)
+```
+```{r}
+which.max(fwd.summary$adjr2)
+```
+```{r}
+par(mfrow = c(2, 2))
+plot(fwd.summary$cp, xlab = "Subset Size", ylab = "Cp", pch = 20, type = "l")
+points(24, fwd.summary$cp[24], pch = 4, col = "red", lwd = 7)
+plot(fwd.summary$bic, xlab = "Subset Size", ylab = "BIC", pch = 20, type = "l") 
+points(21, fwd.summary$bic[21], pch = 4, col = "red", lwd = 7)
+plot(fwd.summary$adjr2, xlab = "Subset Size", ylab = "Adjusted R2", pch = 20, type = "l") 
+points(25, fwd.summary$adjr2[25], pch = 4, col = "red", lwd = 7)
+coef(fit.fwd, which.max(fwd.summary$adjr2))
+```
+
+```{r}
+k = 10
+set.seed(123)
+folds = sample(1:k, nrow(train), replace = TRUE) 
+cv.errors = matrix(NA, k, 27, dimnames = list(NULL, paste(1:27)))
+
+for(j in 1:k){
+  fit.fwd = regsubsets(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                         X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+GarageCars+GarageArea+WoodDeckSF+ScreenPorch,
+                       data = train[folds != j,], nvmax = 27, method = "forward")
+  for (i in 1:27){
+    pred = predict.regsubsets(fit.fwd, train[folds == j, ], id = i)
+    cv.errors[j, i] = mean((train$SalePrice[folds == j] - pred)^2) 
+    }
+}
+mean.cv.errors = apply(cv.errors, 2, mean) 
+mean.cv.errors
+
+mse.fwd <- min(mean.cv.errors) 
+names(which.min(mean.cv.errors))     
+```
+
+```{r}
+fit.fwd = regsubsets(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                       X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+ 
+                       GarageCars+GarageArea+WoodDeckSF+ScreenPorch, train, nvmax = 26, method = "forward")
+test.mat = model.matrix( ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                           X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+
+                           GarageCars+GarageArea+WoodDeckSF+ScreenPorch, test)
+coefi = coef(fit.fwd, id = 26)
+pred.fwd = test.mat[,names(coefi)]%*%coefi
+pred.fwd = data.frame(exp(pred.fwd)-1)
+test.fwd <- data.frame(Id = test.id, SalePrice = pred.fwd[, 1]) 
+head(test.fwd, 5)
+```
+
+```{r}
+write.csv(test.fwd,file='Forward Selection Housing Price.csv',row.names = FALSE)
+```
+
+
+##### Backward Selection
+```{r}
+fit.bwd <- regsubsets(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                        X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+ 
+                        GarageCars+GarageArea+WoodDeckSF+ScreenPorch, data = train, nvmax = 27, method = 'backward')
+bwd.summary <- summary(fit.bwd) 
+which.min(bwd.summary$cp)
+
+```
+
+```{r}
+which.min(bwd.summary$bic)
+```
+
+```{r}
+which.max(bwd.summary$adjr2)
+```
+
+```{r}
+par(mfrow = c(2, 2))
+plot(bwd.summary$cp, xlab = "Subset Size", ylab = "Cp", pch = 20, type = "l")
+points(24, bwd.summary$cp[24], pch = 4, col = "red", lwd = 7)
+plot(bwd.summary$bic, xlab = "Subset Size", ylab = "BIC", pch = 20, type = "l") 
+points(21, bwd.summary$bic[21], pch = 4, col = "red", lwd = 7)
+plot(bwd.summary$adjr2, xlab = "Subset Size", ylab = "Adjusted R2", pch = 20, type = "l") 
+points(25, bwd.summary$adjr2[25], pch = 4, col = "red", lwd = 7)
+coef(fit.bwd, which.max(bwd.summary$adjr2))
+```
+
+```{r}
+k = 10
+set.seed(123)
+folds = sample(1:k, nrow(train), replace = TRUE) 
+cv.errors = matrix(NA, k, 27, dimnames = list(NULL, paste(1:27))) 
+for(j in 1:k){
+  best.fit = regsubsets(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                          X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+ 
+                          GarageCars+GarageArea+WoodDeckSF+ScreenPorch, data = train[folds != j,], nvmax = 27, method = "backward")
+  for (i in 1:27){
+    pred = predict.regsubsets(best.fit, train[folds == j, ], id = i) 
+    cv.errors[j, i] = mean((train$SalePrice[folds == j] - pred)^2)
+    }
+}
+mean.cv.errors = apply(cv.errors, 2, mean) 
+mean.cv.errors
+mse.bwd <- min(mean.cv.errors) 
+names(which.min(mean.cv.errors))
+
+
+```
+
+```{r}
+fit.bwd = regsubsets(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                       X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+
+                       GarageCars+GarageArea+WoodDeckSF+ScreenPorch, train, nvmax = 26, method = 'backward')
+test.mat = model.matrix( ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                           X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+
+                           TotRmsAbvGrd+Fireplaces+ GarageCars+GarageArea+WoodDeckSF+ScreenPorch, test)
+coefi = coef(fit.bwd, id = 26)
+pred.bwd = test.mat[,names(coefi)]%*%coefi
+pred.bwd = data.frame(exp(pred.bwd)-1)
+test.bwd <- data.frame(Id = test.id, SalePrice = pred.bwd[, 1]) 
+head(test.bwd, 5)
+```
+
+```{r}
+write.csv(test.bwd,file='Backward Selection Housing Price.csv',row.names = FALSE)
+```
+
+##### Shrinkage Methods
+
+###### Ridge
+```{r}
+set.seed(123)
+train.index = sample(nrow(train), 1000)
+test.index = -train.index
+ridge.train = train[train.index, ]
+ridge.test = train[test.index, ]
+x.train = model.matrix(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+
+                       YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+
+                         BsmtFullBath+BsmtHalfBath+FullBath+
+                         HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+GarageCars+GarageArea+
+                         WoodDeckSF+ScreenPorch, ridge.train)[,-1]
+x.test = model.matrix(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+
+                        BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                        X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+
+                        KitchenAbvGr+TotRmsAbvGrd+Fireplaces+GarageCars+GarageArea+WoodDeckSF+ScreenPorch,
+                      ridge.test)[,-1]
+grid = 10^seq(10, -2, length = 100)
+fit.ridge = cv.glmnet(x.train, ridge.train$SalePrice, alpha = 0, lambda = grid, thresh = 1e-12)
+lambda = fit.ridge$lambda.min
+pred.ridge = predict(fit.ridge, newx = x.test, s = lambda)
+# cv estimate
+mse.ridge <- mean((ridge.test$SalePrice-pred.ridge)^2)
+mse.ridge
+```
+
+```{r}
+set.seed(123)
+x.train <- model.matrix(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+
+                        YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+ 
+                          HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+GarageCars+GarageArea+WoodDeckSF+ScreenPorch, train)[,-1]
+x.test <- model.matrix( ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                          X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces
+                        +GarageCars+GarageArea+WoodDeckSF+ScreenPorch,
+                        test)[,-1]
+grid <- 10^seq(10, -2, length = 100)
+fit.ridge <- cv.glmnet(x.train, train$SalePrice, alpha = 0, lambda = grid, thresh = 1e-12) 
+lambda <- fit.ridge$lambda.min
+pred.ridge <- data.frame(exp(predict(fit.ridge, newx = x.test, s = lambda)) - 1)
+test.ridge <- data.frame(Id = test.id, SalePrice = pred.ridge[, 1]) 
+head(test.ridge, 5)
+```
+
+```{r}
+write.csv(test.ridge,file='Shrinkage-Ridge Housing Price.csv',row.names = FALSE)
+```
+
+
+##### Lasso
+```{r}
+set.seed(123)
+train.index = sample(nrow(train), 1000)
+test.index = -train.index
+lasso.train = train[train.index, ]
+lasso.test = train[test.index, ]
+x.train = model.matrix(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+
+                       YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+
+                         BsmtFullBath+BsmtHalfBath+FullBath+
+                         HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+GarageCars+GarageArea+
+                         WoodDeckSF+ScreenPorch, lasso.train)[,-1]
+x.test = model.matrix(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+
+                        BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                        X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+
+                        KitchenAbvGr+TotRmsAbvGrd+Fireplaces+GarageCars+GarageArea+WoodDeckSF+ScreenPorch,
+                     lasso.test)[,-1]
+grid = 10^seq(10, -2, length = 100)
+fit.lasso = cv.glmnet(x.train, lasso.train$SalePrice, alpha = 1, lambda = grid, thresh = 1e-12)
+lambda = fit.lasso$lambda.min
+pred.lasso = predict(fit.lasso, newx = x.test, s = lambda)
+# cv estimate
+mse.lasso <- mean((lasso.test$SalePrice-pred.lasso)^2)
+mse.lasso
+```
+
+```{r}
+set.seed(123)
+x.train <- model.matrix(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+
+                        YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+ 
+                          HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+GarageCars+GarageArea+WoodDeckSF+ScreenPorch, train)[,-1]
+x.test <- model.matrix( ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                          X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces
+                        +GarageCars+GarageArea+WoodDeckSF+ScreenPorch,
+                        test)[,-1]
+grid <- 10^seq(10, -2, length = 100)
+fit.lasso <- cv.glmnet(x.train, train$SalePrice, alpha = 1, lambda = grid, thresh = 1e-12) 
+lambda <- fit.lasso$lambda.min
+pred.lasso <- data.frame(exp(predict(fit.lasso, newx = x.test, s = lambda)) - 1)
+test.lasso <- data.frame(Id = test.id, SalePrice = pred.lasso[, 1]) 
+head(test.lasso, 5)
+```
+
+```{r}
+write.csv(test.lasso,file='Shrinkage-lasso Housing Price.csv',row.names = FALSE)
+```
+
+
+
+##### GAM Method
+
+Firstly, we use smooth.spline to find out the best df for each variables in gam model.
+
+```{r}
+smooth.spline(train$SalePrice,train$LotArea,cv=TRUE)
+```
+```{r}
+smooth.spline(train$SalePrice,train$OverallQual,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$OverallCond,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$YearBuilt,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$YearRemodAdd,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$BsmtFinSF1,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$BsmtFinSF2,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$BsmtUnfSF,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$X1stFlrSF,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$X2ndFlrSF,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$LowQualFinSF,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$BedroomAbvGr,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$KitchenAbvGr,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$TotRmsAbvGrd,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$GarageArea,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$WoodDeckSF,cv=TRUE)
+```
+
+```{r}
+smooth.spline(train$SalePrice,train$ScreenPorch,cv=TRUE)
+```
+
+
+```{r}
+library(gam)
+sp.gam <- gam(SalePrice~ MSZoning+s(LotArea,df=7)+s(OverallQual,df=7)+s(OverallCond,df=8)+s(YearBuilt,df=13)+s(YearRemodAdd,df=7)+s(BsmtFinSF1,df=16)+s(BsmtFinSF2,df=2)+s(BsmtUnfSF,df=4)+s(X1stFlrSF,df=3)+s(X2ndFlrSF,df=9)+s(LowQualFinSF,df=4)+BsmtFullBath+BsmtHalfBath+FullBath+HalfBath+s(BedroomAbvGr,df=4)+s(KitchenAbvGr,df=15)+s(TotRmsAbvGrd,df=2)+Fireplaces+GarageCars+s(GarageArea,df=6)+s(WoodDeckSF,df=12)+s(ScreenPorch,df=17),data=train)
+```
+
+```{r}
+plot(sp.gam,se=TRUE,col='blue')
+```
+
+```{r}
+train.gam <- predict(sp.gam,train)
+mse.gam <- mean((train.gam-train$SalePrice)^2)
+mse.gam
+```
+
+
+
+```{r}
+yhat.gam <- predict(sp.gam,newdata = test)
+test.gam <- data.frame(Id=test.id,SalePrice=exp(yhat.gam)-1)
+head(test.gam,5)
+```
+
+```{r}
+write.csv(test.gam,file = 'GAM Model Housing Price.csv',row.names = FALSE)
+```
+
+##### Regression Tree Method
+
+Firstly, we use all the variables we use before to create a unpruned tree model.
+
+```{r}
+library(tree)
+sp.tree <- tree(SalePrice~.,data=train)
+summary(sp.tree)
+
+```
+Tree model MSE for training: 0.04059
+Terminal Nodes: 10
+
+
+```{r}
+plot(sp.tree)
+text(sp.tree,pretty=0)
+```
+
+```{r}
+train.tree <- predict(sp.tree,train)
+mse.tree <- mean((train.tree-train$SalePrice)^2)
+mse.tree
+```
+
+
+```{r}
+sp.tree.pred <- predict(sp.tree,newdata=test)
+sp.tree.table <- data.frame(Id=test.id,SalePrice=exp(sp.tree.pred)-1)
+head(sp.tree.table,5)
+```
+
+```{r}
+write.csv(sp.tree.table,file='Tree Model Housing Price.csv',row.names = FALSE)
+```
+
+```{r}
+set.seed(422)
+cv.bal <- cv.tree(sp.tree,K=10)
+best.size <- cv.bal$size[which.min(cv.bal$dev)]
+best.size
+
+```
+
+Since the cross-validation we ran indicate that the best terminal node size for tree model is 10 which is the same as unpruned tree, we might just choose unpruned tree as our tree regression method.
+
+##### Bagging
+```{r}
+library(randomForest)
+sp.bag <- randomForest(SalePrice ~.,data=train,mtry=78,importance=TRUE,ntree=1000)
+importance(sp.bag)
+varImpPlot(sp.bag)
+
+```
+
+From the above summary, we can conclude that predictor OverallQual is the most important predictor among all since the %IncMSE parameter is the largest among all.
+
+```{r}
+train.bag <- predict(sp.bag,train)
+mse.bag <- mean((train.bag-train$SalePrice)^2)
+mse.bag
+```
+
+
+```{r}
+sp.bag.pred <- predict(sp.bag,newdata=test)
+sp.bag.table <- data.frame(Id=test.id,SalePrice=exp(sp.bag.pred)-1)
+head(sp.bag.table,5)
+  
+```
+
+```{r}
+write.csv(sp.bag.table,file = 'Bagging Method Housing Price.csv',row.names = FALSE)
+```
+
+
+##### RandomForest Method
+```{r}
+set.seed(422)
+sp.rf <- randomForest(SalePrice~.,data=train,mtry=round(sqrt(78)),importance=TRUE,ntree=1000)
+importance(sp.rf)
+varImpPlot(sp.rf)
+
+```
+
+It seems like GrLivingArea predictor is the most important predictors all.
+
+```{r}
+train.random <- predict(sp.rf,train)
+mse.random <- mean((train.random-train$SalePrice)^2)
+mse.random
+```
+
+
+```{r}
+sp.rf.pred <- predict(sp.rf,newdata=test)
+sp.rf.table <- data.frame(Id=test.id,SalePrice=exp(sp.rf.pred)-1)
+head(sp.bag.table,5)
+```
+
+```{r}
+write.csv(sp.rf.table,file='RandomForest Housing Price.csv',row.names = FALSE)
+```
+
+
+##### Boosting
+```{r}
+library(gbm)
+sp.gbm <- gbm(SalePrice~.,data=train,distribution='gaussian',shrinkage=0.01,n.tree=1000,interaction.depth=10,cv.folds=10)
+summary(sp.gbm)
+
+```
+
+From above summary table we can conclude that OverallQual is the most important predictor among all since its relative influence is 34.9 which larger than any of other predictors.
+
+```{r}
+train.gbm <- predict(sp.gbm,train)
+mse.gbm <- mean((train.gbm-train$SalePrice)^2)
+mse.gbm
+```
+
+
+```{r}
+sp.gbm.yhat <- predict(sp.gbm,newdata=test,n.trees=which.min(sp.gbm$cv.error))
+sp.gbm.table <- data.frame(Id=test.id,SalePrice=exp(sp.gbm.yhat)-1)
+head(sp.gbm.table,5)
+
+
+```
+
+```{r}
+write.csv(sp.gbm.table,file='Boosting Housing Price.csv',row.names = FALSE)
+```
+
+##### KNN
+
+```{r}
+set.seed(123)
+x <- model.matrix(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+
+                    YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+ X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+
+                    HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+ GarageCars+GarageArea+WoodDeckSF+ScreenPorch, train)[, -1]
+y <- train[, length(train)]
+fold.index <- cut(sample(1:nrow(train)), breaks=10, labels=FALSE) 
+k.value <- c(1,50,100)
+error.k <- rep(0, length(k.value))
+counter <- 0
+for(k in k.value){
+  counter <- counter + 1
+  error <- 0
+  for(i in 1:10){
+    pred.knn <- knn(x[fold.index!=i,], x[fold.index==i,], y[fold.index!=i], k=k)
+    error <- error + sum(pred.knn != y[fold.index==i]) 
+  }
+  error.k[counter] <- error/nrow(train) 
+}
+print(error.k)
+```
+
+
+```{r}
+set.seed(123)
+x.train <- model.matrix(SalePrice ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+
+                        YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+ X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+
+                          HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+ GarageCars+GarageArea+WoodDeckSF+ScreenPorch,train)[,-1]
+x.test <- model.matrix( ~ MSZoning+LotArea+OverallQual+OverallCond+YearBuilt+ YearRemodAdd+BsmtFinSF1+BsmtFinSF2+BsmtUnfSF+X1stFlrSF+
+                          X2ndFlrSF+LowQualFinSF+BsmtFullBath+BsmtHalfBath+FullBath+ HalfBath+BedroomAbvGr+KitchenAbvGr+TotRmsAbvGrd+Fireplaces+ GarageCars+GarageArea+WoodDeckSF+ScreenPorch,
+                        test)[,-1]
+pred.knn <- knn(x.train, x.test, train$SalePrice, k=10) 
+pred.knn <- exp(as.numeric(as.character(pred.knn)))-1 
+test.knn <- data.frame(Id = test.id, SalePrice = pred.knn) 
+head(test.knn, 5)
+```
+```{r}
+write.csv(test.knn,file='KNN Method Housing Price.csv',row.names = FALSE)
+```
+
+
+### Conclusion
+
+##### Based on training mse
+
+After all the analysis we have done, we can see their training mse to predict what might be the best model for this dataset.
+```{r}
+mse.lm
+mse.best
+mse.fwd
+mse.bwd
+mse.lasso
+mse.ridge
+mse.gam
+mse.tree
+mse.bag
+mse.random
+mse.gbm
+1-error.k
+
+```
+
+From above data we can conclude, based on the training mse we might want to use bagging method in the testing dataset to for best saleprice prediction. However, We might want to comparing testing MSE or true error form testing dataset and see which one might actually perform the best. 
+
+
+##### Based on True error
+
+From the true error we ca clear see that boosting method is the best method for this dataset because of the lowest true error and the relatively low training error among all methods.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
